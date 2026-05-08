@@ -22,9 +22,25 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(50), default="employee")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     balance_debt: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    team: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     orders: Mapped[list[Order]] = relationship("Order", back_populates="user")
+
+
+class InviteCode(Base):
+    __tablename__ = "invite_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    used_by: Mapped[int | None] = mapped_column(BigInteger)
+    is_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    role: Mapped[str] = mapped_column(String(50), default="employee")
+    initial_debt: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Category(Base):
@@ -49,6 +65,8 @@ class MenuItem(Base):
     photo_url: Mapped[str | None] = mapped_column(String(500))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_stop_list: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     category: Mapped[Category | None] = relationship("Category", back_populates="items")
 
@@ -60,7 +78,7 @@ class Order(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     order_date: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="active")
-    total_price:  Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    total_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     daily_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -91,6 +109,8 @@ class CancelRequest(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending")
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[int | None] = mapped_column(BigInteger)
 
     order: Mapped[Order] = relationship("Order", back_populates="cancel_requests")
 
@@ -100,3 +120,4 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
