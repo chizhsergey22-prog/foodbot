@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import logging
 from datetime import date, timedelta
 from decimal import Decimal
 import pytz
@@ -8,15 +9,20 @@ from pydantic import BaseModel
 from sqlalchemy import select, extract, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
-from db.models import Order, OrderItem, User, Setting, CancelRequest
+from db.models import Order, OrderItem, MenuItem, User, Setting, CancelRequest
 from dependencies import CurrentUser, DbSession
 from config import settings
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+logger = logging.getLogger(__name__)
 
 
 def _cart_key(user_id: int) -> str:
     return f"cart:{user_id}"
+
+
+def _lock_key(user_id: int, order_date: date) -> str:
+    return f"order_lock:{user_id}:{order_date}"
 
 
 def _get_redis():
@@ -28,7 +34,6 @@ def _get_redis():
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_order(user: CurrentUser, session: DbSession):
-    # Проверяем дедлайн
     from routers.cart import _get_order_date_and_lock, _load_settings
     cutoff_str, working_sats = await _load_settings(session)
     order_date, is_locked = _get_order_date_and_lock(cutoff_str, working_sats)
@@ -36,67 +41,102 @@ async def create_order(user: CurrentUser, session: DbSession):
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Приём заказов завершён")
 
-    # Берём корзину из Redis
+    # п.15: Redis lock — защита от двойного оформления
+    lock_key = _lock_key(user.id, order_date)
     redis = _get_redis()
     try:
-        raw = await redis.get(_cart_key(user.id))
+        acquired = await redis.set(lock_key, "1", nx=True, ex=10)
     finally:
         await redis.aclose()
 
-    if not raw:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
+    if not acquired:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Заказ уже оформляется")
 
-    cart_items = json.loads(raw)
-    if not cart_items:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
-
-
-    # Порядковый номер заказа за день с retry на случай гонки
-    total = Decimal(0)
-    order = None
-    for attempt in range(5):
-        max_res = await session.execute(
-            select(func.max(Order.daily_number)).where(Order.order_date == order_date)
-        )
-        daily_number = (max_res.scalar() or 0) + 1
-        order = Order(user_id=user.id, order_date=order_date, status="active", daily_number=daily_number)
-        session.add(order)
+    try:
+        # Читаем корзину из Redis
+        redis = _get_redis()
         try:
-            async with session.begin_nested():
-                await session.flush()
-            break
-        except IntegrityError:
-            session.expunge(order)
-            if attempt == 4:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Не удалось создать заказ")
+            raw = await redis.get(_cart_key(user.id))
+        finally:
+            await redis.aclose()
 
-    for ci in cart_items:
-        price = Decimal(str(ci["price"]))
-        qty = ci["quantity"]
-        item = OrderItem(
-            order_id=order.id,
-            menu_item_id=ci["menu_item_id"],
-            item_name=ci["name"],
-            quantity=qty,
-            price=price,
+        if not raw:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
+
+        cart_items = json.loads(raw)
+        if not cart_items:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
+
+        # п.5: Берём цены и названия из БД — не доверяем Redis
+        item_ids = [ci["menu_item_id"] for ci in cart_items if ci.get("menu_item_id")]
+        db_items_res = await session.execute(
+            select(MenuItem).where(MenuItem.id.in_(item_ids), MenuItem.is_active == True)
         )
-        session.add(item)
-        total += price * qty
+        db_items: dict[int, MenuItem] = {item.id: item for item in db_items_res.scalars().all()}
 
-    order.total_price = total
-    await session.commit()
+        valid_cart = [ci for ci in cart_items if ci.get("menu_item_id") in db_items]
+        if not valid_cart:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Все блюда из корзины недоступны")
 
-    # Чистим корзину
+        # п.6: Все операции с БД до commit
+        total = Decimal(0)
+        order = None
+        for attempt in range(5):
+            max_res = await session.execute(
+                select(func.max(Order.daily_number)).where(Order.order_date == order_date)
+            )
+            daily_number = (max_res.scalar() or 0) + 1
+            order = Order(user_id=user.id, order_date=order_date, status="active", daily_number=daily_number)
+            session.add(order)
+            try:
+                async with session.begin_nested():
+                    await session.flush()
+                break
+            except IntegrityError:
+                session.expunge(order)
+                if attempt == 4:
+                    logger.error("daily_number exhausted user=%s date=%s", user.id, order_date)
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Не удалось создать заказ")
+
+        for ci in valid_cart:
+            db_item = db_items[ci["menu_item_id"]]
+            qty = ci["quantity"]
+            session.add(OrderItem(
+                order_id=order.id,
+                menu_item_id=db_item.id,
+                item_name=db_item.name,
+                quantity=qty,
+                price=db_item.price,
+            ))
+            total += db_item.price * qty
+
+        order.total_price = total
+        await session.commit()
+        logger.info("Order created order_id=%s user_id=%s date=%s total=%s", order.id, user.id, order_date, total)
+
+    finally:
+        # Снимаем lock в любом случае — заказ создан или упал
+        redis = _get_redis()
+        try:
+            await redis.delete(lock_key)
+        except Exception:
+            logger.warning("Failed to release order lock user=%s", user.id)
+        finally:
+            await redis.aclose()
+
+    # п.6: После успешного commit — чистим корзину
     redis = _get_redis()
     try:
         await redis.delete(_cart_key(user.id))
+    except Exception:
+        logger.warning("Failed to clear cart after order creation user=%s", user.id)
     finally:
         await redis.aclose()
 
-    # Уведомление пользователю в бот
+    # п.6: После commit — Telegram уведомление (сбой не ломает заказ)
     items_text = "\n".join(
-        f"• {ci['name']}" + (f" ×{ci['quantity']}" if ci["quantity"] > 1 else "")
-        for ci in cart_items
+        f"• {db_items[ci['menu_item_id']].name}" + (f" ×{ci['quantity']}" if ci["quantity"] > 1 else "")
+        for ci in valid_cart
     )
     tg_text = (
         f"✅ <b>Заказ №{daily_number} оформлен!</b>\n\n"
@@ -114,7 +154,7 @@ async def create_order(user: CurrentUser, session: DbSession):
                 "parse_mode": "HTML",
             })
         except Exception:
-            pass
+            logger.exception("Telegram notification failed order_id=%s user_id=%s", order.id, user.id)
 
     return {"order_id": order.id, "order_date": str(order_date), "total": float(total)}
 
@@ -242,9 +282,9 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
         raise HTTPException(status_code=404, detail="Заказ не найден")
 
     if order.status == "active":
-        # Долг ещё не начислен (начисляется планировщиком в дедлайн) — просто отменяем
         order.status = "cancelled"
         await session.commit()
+        logger.info("Order cancelled order_id=%s user_id=%s", order_id, user.id)
         return {"status": "cancelled"}
 
     if order.status == "locked":
@@ -259,8 +299,8 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
         order.status = "cancel_requested"
         await session.commit()
         await session.refresh(cr)
+        logger.info("Cancel requested order_id=%s user_id=%s request_id=%s", order_id, user.id, cr.id)
 
-        # Уведомляем суперадминов через Telegram Bot API (без aiogram)
         admins = (await session.execute(
             select(User).where(User.role == "super_admin", User.is_active == True)
         )).scalars().all()
@@ -271,11 +311,11 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
             f"({float(order.total_price):.0f} ₴)\n"
             f"Запрос #: {cr.id}"
         )
-        import aiohttp, json as _json
         kb = {"inline_keyboard": [[
             {"text": "✅ Подтвердить", "callback_data": f"cancel_approve:{cr.id}"},
             {"text": "❌ Отклонить",   "callback_data": f"cancel_reject:{cr.id}"},
         ]]}
+        import aiohttp
         url = f"https://api.telegram.org/bot{settings.BOT_TOKEN}/sendMessage"
         async with aiohttp.ClientSession() as http:
             for admin in admins:
@@ -287,7 +327,7 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
                         "reply_markup": kb,
                     })
                 except Exception:
-                    pass
+                    logger.exception("Failed to notify admin telegram_id=%s for cancel request=%s", admin.telegram_id, cr.id)
 
         return {"status": "cancel_requested", "request_id": cr.id}
 

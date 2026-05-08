@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     REDIS_URL: str = "redis://redis:6379/0"
     TIMEZONE: str = "Europe/Kyiv"
+    CORS_ORIGINS: str = ""
 
 
 settings = Settings()

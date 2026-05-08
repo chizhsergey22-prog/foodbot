@@ -5,7 +5,7 @@ import time
 from urllib.parse import parse_qsl, unquote
 from fastapi import HTTPException, status
 
-AUTH_DATA_MAX_AGE = 86400  # 24 hours
+MAX_INIT_DATA_AGE_SECONDS = 3600  # 1 hour
 
 
 def validate_init_data(init_data: str, bot_token: str) -> dict:
@@ -29,8 +29,14 @@ def validate_init_data(init_data: str, bot_token: str) -> dict:
     if not hmac.compare_digest(computed_hash, received_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
 
-    auth_date = int(parsed.get("auth_date", 0))
-    if time.time() - auth_date > AUTH_DATA_MAX_AGE:
+    auth_date_raw = parsed.get("auth_date")
+    if not auth_date_raw:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing auth_date")
+    try:
+        auth_date = int(auth_date_raw)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth_date")
+    if time.time() - auth_date > MAX_INIT_DATA_AGE_SECONDS:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Init data expired")
 
     if "user" in parsed:
