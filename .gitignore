@@ -1,0 +1,25 @@
+# Секреты
+.env
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node / React
+node_modules/
+dist/
+frontend/dist/
+
+# Docker volumes / данные
+postgres_data/
+redis_data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
