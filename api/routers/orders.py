@@ -6,6 +6,7 @@ import pytz
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, extract, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from db.models import Order, OrderItem, User, Setting, CancelRequest
 from dependencies import CurrentUser, DbSession
@@ -50,16 +51,24 @@ async def create_order(user: CurrentUser, session: DbSession):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
 
 
-    # Порядковый номер заказа за день (по всем пользователям)
-    count_today = await session.execute(
-        select(func.count(Order.id)).where(Order.order_date == order_date)
-    )
-    daily_number = (count_today.scalar() or 0) + 1
-
+    # Порядковый номер заказа за день с retry на случай гонки
     total = Decimal(0)
-    order = Order(user_id=user.id, order_date=order_date, status="active", daily_number=daily_number)
-    session.add(order)
-    await session.flush()
+    order = None
+    for attempt in range(5):
+        max_res = await session.execute(
+            select(func.max(Order.daily_number)).where(Order.order_date == order_date)
+        )
+        daily_number = (max_res.scalar() or 0) + 1
+        order = Order(user_id=user.id, order_date=order_date, status="active", daily_number=daily_number)
+        session.add(order)
+        try:
+            async with session.begin_nested():
+                await session.flush()
+            break
+        except IntegrityError:
+            session.expunge(order)
+            if attempt == 4:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Не удалось создать заказ")
 
     for ci in cart_items:
         price = Decimal(str(ci["price"]))
