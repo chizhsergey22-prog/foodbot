@@ -234,6 +234,13 @@ async def _send_daily_summary() -> None:
         )
         admins = admins_res.scalars().all()
 
+        # Получаем сотрудников, которые НЕ сделали заказ
+        ordered_ids = {order.user_id for order in orders}
+        employees_res = await session.execute(
+            select(User).where(User.role == "employee", User.is_active == True)
+        )
+        non_ordering = [u for u in employees_res.scalars().all() if u.id not in ordered_ids]
+
     for admin in admins:
         try:
             await _bot.send_message(admin.telegram_id, kitchen_text, parse_mode="HTML")
@@ -262,6 +269,18 @@ async def _send_daily_summary() -> None:
             await _bot.send_message(order.user.telegram_id, user_text, parse_mode="HTML")
         except Exception as e:
             log.error("Не удалось уведомить пользователя %s: %s", order.user.telegram_id, e)
+
+    # Уведомляем сотрудников, которые не оформили заказ
+    no_order_text = (
+        f"ℹ️ Приём заказов на <b>{date_str}</b> завершён.\n\n"
+        f"Вы не оформили заказ на этот день.\n"
+        f"Форма заказа откроется утром следующего рабочего дня."
+    )
+    for emp in non_ordering:
+        try:
+            await _bot.send_message(emp.telegram_id, no_order_text, parse_mode="HTML")
+        except Exception as e:
+            log.error("Не удалось уведомить сотрудника %s: %s", emp.telegram_id, e)
 
 
 def _esc(text: str) -> str:

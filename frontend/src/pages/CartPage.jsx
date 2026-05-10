@@ -200,19 +200,29 @@ export default function CartPage() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="font-semibold text-base">Заказ на {orderDate}</h2>
       </div>
-      <div className="text-center py-12">
-        <p className="text-4xl mb-3">🛒</p>
-        <p className="text-sm mb-4" style={{ color: 'var(--tg-theme-hint-color, #888)' }}>
-          Корзина пуста
-        </p>
-        <button
-          onClick={() => setPage('menu')}
-          className="px-6 py-2 rounded-full text-sm font-medium"
-          style={{ background: 'var(--tg-theme-button-color, #2481cc)', color: '#fff' }}
-        >
-          Перейти в меню
-        </button>
-      </div>
+      {cart.is_locked ? (
+        <div className="text-center py-12">
+          <p className="text-4xl mb-3">🔒</p>
+          <p className="font-semibold mb-2">Приём заказов закрыт</p>
+          <p className="text-sm" style={{ color: 'var(--tg-theme-hint-color, #888)' }}>
+            Форма заказа откроется завтра утром
+          </p>
+        </div>
+      ) : (
+        <div className="text-center py-12">
+          <p className="text-4xl mb-3">🛒</p>
+          <p className="text-sm mb-4" style={{ color: 'var(--tg-theme-hint-color, #888)' }}>
+            Корзина пуста
+          </p>
+          <button
+            onClick={() => setPage('menu')}
+            className="px-6 py-2 rounded-full text-sm font-medium"
+            style={{ background: 'var(--tg-theme-button-color, #2481cc)', color: '#fff' }}
+          >
+            Перейти в меню
+          </button>
+        </div>
+      )}
     </div>
   )
 }
