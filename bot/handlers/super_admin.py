@@ -504,6 +504,9 @@ async def ao_add_item(callback: CallbackQuery, state: FSMContext):
         res = await session.execute(select(MenuItem).where(MenuItem.id == int(item_id)))
         item = res.scalar_one_or_none()
 
+    if item is None:
+        await callback.answer("Блюдо недоступно.", show_alert=True)
+        return
     await callback.answer(f"✓ {item.name} ×{selected[item_id]}")
 
 
@@ -521,8 +524,11 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
     async with async_session_maker() as session:
         wsat_res = await session.execute(select(Setting).where(Setting.key == "working_saturdays"))
         wsat_row = wsat_res.scalar_one_or_none()
+        cutoff_res = await session.execute(select(Setting).where(Setting.key == "cutoff_time"))
+        cutoff_row = cutoff_res.scalar_one_or_none()
         working_sats = parse_working_sats(wsat_row.value if wsat_row else "")
-    order_date = get_next_order_date(working_sats=working_sats)
+        h, m = parse_cutoff(cutoff_row.value if cutoff_row else "17:00")
+    order_date = get_next_order_date(cutoff_hour=h, cutoff_minute=m, working_sats=working_sats)
 
     async with async_session_maker() as session:
         item_ids = [int(k) for k in selected]
@@ -622,8 +628,6 @@ async def on_cancel_approve(callback: CallbackQuery, db_user: User | None):
             user_res = await session.execute(select(User).where(User.id == order.user_id))
             user = user_res.scalar_one_or_none()
             if user:
-                user.balance_debt -= order.total_price
-                # Возвращаем доставку если это был последний заказ дня
                 remaining = await session.execute(
                     select(func.count(Order.id)).where(
                         Order.user_id == order.user_id,
@@ -632,8 +636,8 @@ async def on_cancel_approve(callback: CallbackQuery, db_user: User | None):
                         Order.id != order.id,
                     )
                 )
-                if (remaining.scalar() or 0) == 0:
-                    user.balance_debt -= Decimal("10")
+                refund = order.total_price + (Decimal("10") if (remaining.scalar() or 0) == 0 else Decimal("0"))
+                user.balance_debt = max(Decimal(0), user.balance_debt - refund)
 
         await session.commit()
 
@@ -677,6 +681,8 @@ async def on_cancel_reject(callback: CallbackQuery, db_user: User | None):
 
         order_res = await session.execute(select(Order).where(Order.id == req.order_id))
         order = order_res.scalar_one_or_none()
+        if order and order.status == "cancel_requested":
+            order.status = "locked"
 
         await session.commit()
 

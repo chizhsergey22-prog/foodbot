@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from db.models import User, MenuItem, Order
 from db.connection import async_session_maker
-from utils.time_utils import get_next_order_date, parse_working_sats
+from utils.time_utils import get_next_order_date, parse_working_sats, parse_cutoff
 from db.models import Setting
 
 router = Router(name="restaurant_admin")
@@ -21,10 +21,13 @@ def _is_admin(user: User | None) -> bool:
 async def _next_order_date() -> date:
     from sqlalchemy import select as sa_select
     async with async_session_maker() as session:
-        res = await session.execute(sa_select(Setting).where(Setting.key == "working_saturdays"))
-        row = res.scalar_one_or_none()
-    working_sats = parse_working_sats(row.value if row else "")
-    return get_next_order_date(working_sats=working_sats)
+        wsat_res = await session.execute(sa_select(Setting).where(Setting.key == "working_saturdays"))
+        wsat_row = wsat_res.scalar_one_or_none()
+        cutoff_res = await session.execute(sa_select(Setting).where(Setting.key == "cutoff_time"))
+        cutoff_row = cutoff_res.scalar_one_or_none()
+    working_sats = parse_working_sats(wsat_row.value if wsat_row else "")
+    h, m = parse_cutoff(cutoff_row.value if cutoff_row else "17:00")
+    return get_next_order_date(cutoff_hour=h, cutoff_minute=m, working_sats=working_sats)
 
 
 def _parse_date_arg(args: str, today: date) -> date | None:
@@ -33,8 +36,8 @@ def _parse_date_arg(args: str, today: date) -> date | None:
     try:
         parts = args.split(".")
         day, month = int(parts[0]), int(parts[1])
-        year = today.year
-        if month < today.month or (month == today.month and day < today.day):
+        year = today.year if len(parts) < 3 else int(parts[2])
+        if len(parts) < 3 and month < today.month:
             year += 1
         return date(year, month, day)
     except Exception:

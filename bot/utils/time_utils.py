@@ -9,7 +9,7 @@ def get_kyiv_now():
     return datetime.datetime.now(tz)
 
 
-def get_next_order_date(cutoff_hour: int = 17, working_sats: set[date] | None = None) -> date:
+def get_next_order_date(cutoff_hour: int = 17, cutoff_minute: int = 0, working_sats: set[date] | None = None) -> date:
     """
     Возвращает дату, на которую принимаются заказы прямо сейчас.
     working_sats — множество рабочих суббот.
@@ -18,7 +18,7 @@ def get_next_order_date(cutoff_hour: int = 17, working_sats: set[date] | None = 
     today = now.date()
     weekday = today.weekday()  # 0=Пн … 4=Пт, 5=Сб, 6=Вс
 
-    after_cutoff = now.hour >= cutoff_hour
+    after_cutoff = (now.hour, now.minute) >= (cutoff_hour, cutoff_minute)
 
     if weekday == 4:  # Пятница
         tomorrow = today + timedelta(days=1)

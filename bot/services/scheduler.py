@@ -147,7 +147,13 @@ async def _lock_orders() -> None:
         )
         orders = res.scalars().all()
 
-        users_charged: set[int] = set()
+        # Pre-fill users that already have locked orders (created via /addorder)
+        # to avoid charging delivery twice
+        already_res = await session.execute(
+            select(Order.user_id).where(Order.order_date == tomorrow, Order.status == "locked")
+        )
+        users_charged: set[int] = {row[0] for row in already_res.all()}
+
         for order in orders:
             order.status = "locked"
             if order.user:

@@ -47,6 +47,5 @@ class AuthMiddleware(BaseMiddleware):
                 await session.commit()
                 await session.refresh(db_user)
 
-            data["db_user"] = db_user
-            data["db_session"] = session
-            return await handler(event, data)
+        data["db_user"] = db_user
+        return await handler(event, data)
