@@ -110,6 +110,8 @@ async def _send_open_notification() -> None:
     today_kyiv = datetime.now(kyiv_tz).date()
     weekday = today_kyiv.weekday()  # 0=Пн … 5=Сб
 
+    cutoff_day_suffix = ""  # уточнение дня дедлайна, если не сегодня
+
     if weekday in (0, 1, 2, 3):  # Пн–Чт: окно открывается сейчас для завтра
         order_date = today_kyiv + timedelta(days=1)
         open_now = True
@@ -125,6 +127,7 @@ async def _send_open_notification() -> None:
         if today_kyiv in working_sats:  # рабочая суббота — окно на понедельник уже открыто
             order_date = today_kyiv + timedelta(days=2)
             open_now = True
+            cutoff_day_suffix = " воскресенья"  # дедлайн — воскресенье
         else:
             return  # обычная суббота — не отправляем
     else:
@@ -136,7 +139,7 @@ async def _send_open_notification() -> None:
     if open_now:
         text = (
             f"🟢 Приём заказов на <b>{day_acc} {date_str}</b> открыт!\n\n"
-            f"Оформи заказ до <b>{_cutoff_str}</b> 🍽"
+            f"Оформи заказ до <b>{_cutoff_str}</b>{cutoff_day_suffix} 🍽"
         )
     else:
         text = (
