@@ -735,12 +735,15 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             await message.answer("❌ Неверная сумма такси. Пример: /deliver 09.05 150")
             return
 
+    from sqlalchemy.orm import selectinload
     async with async_session_maker() as session:
         res = await session.execute(
-            select(Order).where(
+            select(Order)
+            .where(
                 Order.order_date == target,
                 Order.status.in_(["locked", "cancel_requested"]),
             )
+            .options(selectinload(Order.user), selectinload(Order.items))
         )
         orders = res.scalars().all()
 
@@ -761,9 +764,30 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
 
         await session.commit()
 
+    date_str = target.strftime("%d.%m.%Y")
+    for order in orders:
+        if not order.user:
+            continue
+        num = order.daily_number or order.id
+        items_lines = "\n".join(
+            f"• {item.item_name}" + (f" ×{item.quantity}" if item.quantity > 1 else "")
+            for item in order.items
+        )
+        total = sum(float(item.price) * item.quantity for item in order.items)
+        user_text = (
+            f"✅ <b>Заказ №{num} доставлен!</b>\n\n"
+            f"📅 {date_str}\n\n"
+            f"{items_lines}\n\n"
+            f"💰 Сумма: {total:.0f} ₴"
+        )
+        try:
+            await message.bot.send_message(order.user.telegram_id, user_text, parse_mode="HTML")
+        except Exception:
+            pass
+
     taxi_text = f"\n🚕 Такси: <b>{taxi:.0f} ₴</b>" if taxi is not None else ""
     await message.answer(
-        f"✅ {len(orders)} заказ(ов) на {target.strftime('%d.%m.%Y')} отмечены как <b>доставлены</b>.{taxi_text}",
+        f"✅ {len(orders)} заказ(ов) на {date_str} отмечены как <b>доставлены</b>.{taxi_text}",
         parse_mode="HTML",
     )
 
