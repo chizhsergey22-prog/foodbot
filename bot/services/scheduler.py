@@ -38,7 +38,7 @@ def setup_scheduler(bot: Bot, cutoff_h: int = 17, cutoff_m: int = 0) -> None:
 async def reschedule_jobs(bot: Bot, cutoff_h: int, cutoff_m: int) -> None:
     global _bot
     _bot = bot
-    for job_id in ("lock_orders", "send_summary", "send_reminder", "send_reminder_early"):
+    for job_id in ("lock_orders", "send_summary", "send_reminder", "send_reminder_early", "open_notification"):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
     _add_jobs(cutoff_h, cutoff_m)
@@ -88,6 +88,74 @@ def _add_jobs(h: int, m: int) -> None:
         id="send_reminder_early",
         replace_existing=True,
     )
+
+    # Уведомление об открытии приёма заказов в 12:00 (пн–сб)
+    scheduler.add_job(
+        _send_open_notification,
+        CronTrigger(hour=12, minute=0, day_of_week="mon-sat", timezone=kyiv_tz),
+        id="open_notification",
+        replace_existing=True,
+    )
+
+
+_DAY_ACC = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+
+
+async def _send_open_notification() -> None:
+    """В 12:00 уведомляет всех сотрудников об открытии приёма заказов."""
+    if _bot is None:
+        return
+
+    working_sats = await _get_working_sats()
+    today_kyiv = datetime.now(kyiv_tz).date()
+    weekday = today_kyiv.weekday()  # 0=Пн … 5=Сб
+
+    if weekday in (0, 1, 2, 3):  # Пн–Чт: окно открывается сейчас для завтра
+        order_date = today_kyiv + timedelta(days=1)
+        open_now = True
+    elif weekday == 4:  # Пятница
+        tomorrow = today_kyiv + timedelta(days=1)
+        if tomorrow in working_sats:  # рабочая суббота — окно открывается сейчас
+            order_date = tomorrow
+            open_now = True
+        else:  # обычная суббота — окно откроется в {_cutoff_str} для понедельника
+            order_date = today_kyiv + timedelta(days=3)
+            open_now = False
+    elif weekday == 5:  # Суббота
+        if today_kyiv in working_sats:  # рабочая суббота — окно на понедельник уже открыто
+            order_date = today_kyiv + timedelta(days=2)
+            open_now = True
+        else:
+            return  # обычная суббота — не отправляем
+    else:
+        return
+
+    day_acc = _DAY_ACC[order_date.weekday()]
+    date_str = order_date.strftime("%d.%m")
+
+    if open_now:
+        text = (
+            f"🟢 Приём заказов на <b>{day_acc} {date_str}</b> открыт!\n\n"
+            f"Оформи заказ до <b>{_cutoff_str}</b> 🍽"
+        )
+    else:
+        text = (
+            f"🔔 Сегодня в <b>{_cutoff_str}</b> откроется приём заказов "
+            f"на <b>{day_acc} {date_str}</b>.\n\n"
+            f"Не пропусти! 🍽"
+        )
+
+    async with async_session_maker() as session:
+        res = await session.execute(
+            select(User).where(User.role == "employee", User.is_active == True)
+        )
+        users = res.scalars().all()
+
+    for user in users:
+        try:
+            await _bot.send_message(user.telegram_id, text, parse_mode="HTML")
+        except Exception as e:
+            log.error("Не удалось отправить уведомление об открытии %s: %s", user.telegram_id, e)
 
 
 async def _send_cutoff_reminder() -> None:
