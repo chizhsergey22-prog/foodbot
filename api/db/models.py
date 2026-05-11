@@ -121,3 +121,11 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DailyStat(Base):
+    __tablename__ = "daily_stats"
+
+    order_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    taxi_cost: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

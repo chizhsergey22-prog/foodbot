@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy import select, update, func, extract
-from db.models import User, InviteCode, MenuItem, Category, Order, OrderItem, CancelRequest, Setting
+from db.models import User, InviteCode, MenuItem, Category, Order, OrderItem, CancelRequest, Setting, DailyStat
 from db.connection import async_session_maker
 from keyboards.inline import cancel_request_keyboard
 from config import settings
@@ -705,7 +705,7 @@ async def on_cancel_reject(callback: CallbackQuery, db_user: User | None):
     await callback.answer()
 
 
-# ── /deliver <дата> — отметить заказы как доставленные ──────────────────────
+# ── /deliver <дата> [такси] — отметить заказы как доставленные ───────────────
 
 @router.message(Command("deliver"))
 async def cmd_deliver(message: Message, command: CommandObject, db_user: User | None):
@@ -713,19 +713,27 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
         return
 
     from datetime import date as date_type
-    arg = (command.args or "").strip()
-    if not arg:
-        await message.answer("Использование: /deliver 09.05 или /deliver 09.05.2026")
+    args = (command.args or "").strip().split()
+    if not args:
+        await message.answer("Использование: /deliver 09.05 или /deliver 09.05 150")
         return
 
     try:
-        parts = arg.split(".")
+        parts = args[0].split(".")
         day, month = int(parts[0]), int(parts[1])
         year = int(parts[2]) if len(parts) > 2 else date_type.today().year
         target = date_type(year, month, day)
     except Exception:
         await message.answer("❌ Неверный формат даты. Используй: /deliver 09.05")
         return
+
+    taxi: Decimal | None = None
+    if len(args) >= 2:
+        try:
+            taxi = Decimal(args[1].replace(",", "."))
+        except Exception:
+            await message.answer("❌ Неверная сумма такси. Пример: /deliver 09.05 150")
+            return
 
     async with async_session_maker() as session:
         res = await session.execute(
@@ -742,10 +750,20 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
 
         for order in orders:
             order.status = "delivered"
+
+        if taxi is not None:
+            stat_res = await session.execute(select(DailyStat).where(DailyStat.order_date == target))
+            stat = stat_res.scalar_one_or_none()
+            if stat:
+                stat.taxi_cost = taxi
+            else:
+                session.add(DailyStat(order_date=target, taxi_cost=taxi))
+
         await session.commit()
 
+    taxi_text = f"\n🚕 Такси: <b>{taxi:.0f} ₴</b>" if taxi is not None else ""
     await message.answer(
-        f"✅ {len(orders)} заказ(ов) на {target.strftime('%d.%m.%Y')} отмечены как <b>доставлены</b>.",
+        f"✅ {len(orders)} заказ(ов) на {target.strftime('%d.%m.%Y')} отмечены как <b>доставлены</b>.{taxi_text}",
         parse_mode="HTML",
     )
 

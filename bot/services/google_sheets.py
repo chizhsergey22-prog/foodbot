@@ -4,7 +4,7 @@ import logging
 import calendar
 from datetime import date
 from sqlalchemy import select, extract
-from db.models import Order, User
+from db.models import Order, User, DailyStat
 from db.connection import async_session_maker
 from config import settings
 
@@ -39,11 +39,21 @@ async def _fetch_report_data(month: int, year: int) -> dict:
         )
         orders = ord_res.scalars().all()
 
+        stat_res = await session.execute(
+            select(DailyStat).where(
+                extract("month", DailyStat.order_date) == month,
+                extract("year", DailyStat.order_date) == year,
+            )
+        )
+        stats = stat_res.scalars().all()
+
     # (user_id, date) -> food sum (delivery добавляем при отображении)
     order_lookup: dict[tuple[int, date], float] = {}
     for order in orders:
         key = (order.user_id, order.order_date)
         order_lookup[key] = order_lookup.get(key, 0.0) + float(order.total_price)
+
+    taxi_lookup: dict[date, float] = {s.order_date: float(s.taxi_cost) for s in stats}
 
     return {
         "employees": [
@@ -51,6 +61,7 @@ async def _fetch_report_data(month: int, year: int) -> dict:
             for e in all_employees
         ],
         "order_lookup": order_lookup,
+        "taxi_lookup": taxi_lookup,
     }
 
 
@@ -72,6 +83,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
 
     employees: list[dict] = data["employees"]
     order_lookup: dict[tuple[int, date], float] = data["order_lookup"]
+    taxi_lookup: dict[date, float] = data.get("taxi_lookup", {})
 
     # Рабочие дни месяца (пн–сб, если суббота в заказах)
     num_days_in_month = calendar.monthrange(year, month)[1]
@@ -196,12 +208,21 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
         day_count_row.append(global_day_orders[i] if global_day_orders[i] > 0 else "")
     day_count_row.append(sum(global_day_orders))
 
+    taxi_row = ["Такси"]
+    taxi_month_total = 0.0
+    for d in workdays:
+        t = taxi_lookup.get(d, 0.0)
+        taxi_row.append(int(round(t)) if t > 0 else "")
+        taxi_month_total += t
+    taxi_row.append(int(round(taxi_month_total)) if taxi_month_total > 0 else "")
+
     grand_food = grand_total - n_delivery_days * DELIVERY_FEE
 
     add([""] * n_cols, "blank")
     add(day_count_row, "day_count")
     add(day_food_row, "day_total")
     add(day_del_row, "day_total_delivery")
+    add(taxi_row, "taxi")
     add([""] * n_cols, "blank")
     add(
         ["Итого без доставки"] + [""] * n_days + [int(round(grand_food))],
@@ -213,6 +234,11 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
         + [int(round(grand_total))],
         "grand_total",
     )
+    if taxi_month_total > 0:
+        add(
+            [f"Такси за месяц"] + [""] * n_days + [int(round(taxi_month_total))],
+            "grand_total",
+        )
 
     # ── Запись в таблицу ──────────────────────────────────────────────────────
 
@@ -231,6 +257,8 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
             requests.append(_fmt_row(sheet_id, i, bg=(1.0, 0.9, 0.55), bold=True))
         elif t == "day_count":
             requests.append(_fmt_row(sheet_id, i, bg=(0.68, 0.85, 0.95), bold=True))
+        elif t == "taxi":
+            requests.append(_fmt_row(sheet_id, i, bg=(1.0, 0.85, 0.4), bold=True))
         elif t == "day_total":
             requests.append(_fmt_row(sheet_id, i, bg=(0.76, 0.93, 0.78), bold=True))
         elif t == "day_total_delivery":
