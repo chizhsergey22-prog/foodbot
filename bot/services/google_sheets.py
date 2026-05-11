@@ -128,7 +128,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
             ordered_teams.append(t)
 
     grand_total = 0.0
-    n_delivery_days = len(order_lookup)  # кол-во уникальных (user, day) = доставок
+    n_delivery_days = len(order_lookup)
 
     for team in ordered_teams:
         team_emps = sorted(by_team[team], key=lambda x: x["name"])
@@ -163,8 +163,39 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
 
         grand_total += team_sum
 
+    # Per-day totals from order_lookup
+    workdays_idx = {d: i for i, d in enumerate(workdays)}
+    global_day_food = [0.0] * n_days
+    global_day_orders = [0] * n_days
+    for (uid, d), food in order_lookup.items():
+        if d in workdays_idx:
+            idx = workdays_idx[d]
+            global_day_food[idx] += food
+            global_day_orders[idx] += 1
+
+    day_food_row = ["Итого за день (еда)"]
+    day_del_row = ["Итого за день (с доставкой)"]
+    day_food_sum = 0.0
+    day_del_sum = 0.0
+    for i in range(n_days):
+        if global_day_orders[i] > 0:
+            f = global_day_food[i]
+            t = f + global_day_orders[i] * DELIVERY_FEE
+            day_food_row.append(int(round(f)))
+            day_del_row.append(int(round(t)))
+            day_food_sum += f
+            day_del_sum += t
+        else:
+            day_food_row.append("")
+            day_del_row.append("")
+    day_food_row.append(int(round(day_food_sum)))
+    day_del_row.append(int(round(day_del_sum)))
+
     grand_food = grand_total - n_delivery_days * DELIVERY_FEE
 
+    add([""] * n_cols, "blank")
+    add(day_food_row, "day_total")
+    add(day_del_row, "day_total_delivery")
     add([""] * n_cols, "blank")
     add(
         ["Итого без доставки"] + [""] * n_days + [int(round(grand_food))],
@@ -192,6 +223,10 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
             requests.append(_fmt_row(sheet_id, i, bg=(0.7, 0.7, 0.7), bold=True))
         elif t == "team_total":
             requests.append(_fmt_row(sheet_id, i, bg=(1.0, 0.9, 0.55), bold=True))
+        elif t == "day_total":
+            requests.append(_fmt_row(sheet_id, i, bg=(0.76, 0.93, 0.78), bold=True))
+        elif t == "day_total_delivery":
+            requests.append(_fmt_row(sheet_id, i, bg=(0.34, 0.73, 0.54), bold=True))
         elif t == "grand_total":
             requests.append(_fmt_row(sheet_id, i, bg=(1.0, 0.75, 0.4), bold=True))
         elif t == "employee" and not meta.get("has_orders"):
