@@ -223,14 +223,18 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
     add(day_food_row, "day_total")
     add(day_del_row, "day_total_delivery")
     add(taxi_row, "taxi")
-    delivery_income = n_delivery_days * DELIVERY_FEE
-    diff = int(round(delivery_income - taxi_month_total))
-    diff_label = f"Доставка − Такси ({n_delivery_days} × {int(DELIVERY_FEE)} − {int(round(taxi_month_total))})"
-    add([""] * n_cols, "blank")
-    add(
-        [diff_label] + [""] * n_days + [diff],
-        "grand_total",
-    )
+
+    delivery_row = ["Доставка"]
+    delivery_month_total = 0.0
+    for i in range(n_days):
+        if global_day_orders[i] > 0:
+            d_fee = int(round(global_day_orders[i] * DELIVERY_FEE))
+            delivery_row.append(d_fee)
+            delivery_month_total += d_fee
+        else:
+            delivery_row.append("")
+    delivery_row.append(int(round(delivery_month_total)))
+    add(delivery_row, "day_total_delivery")
 
     # ── Запись в таблицу ──────────────────────────────────────────────────────
 
