@@ -191,9 +191,15 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
     day_food_row.append(int(round(day_food_sum)))
     day_del_row.append(int(round(day_del_sum)))
 
+    day_count_row = ["Кол-во заказов"]
+    for i in range(n_days):
+        day_count_row.append(global_day_orders[i] if global_day_orders[i] > 0 else "")
+    day_count_row.append(sum(global_day_orders))
+
     grand_food = grand_total - n_delivery_days * DELIVERY_FEE
 
     add([""] * n_cols, "blank")
+    add(day_count_row, "day_count")
     add(day_food_row, "day_total")
     add(day_del_row, "day_total_delivery")
     add([""] * n_cols, "blank")
@@ -223,6 +229,8 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
             requests.append(_fmt_row(sheet_id, i, bg=(0.7, 0.7, 0.7), bold=True))
         elif t == "team_total":
             requests.append(_fmt_row(sheet_id, i, bg=(1.0, 0.9, 0.55), bold=True))
+        elif t == "day_count":
+            requests.append(_fmt_row(sheet_id, i, bg=(0.68, 0.85, 0.95), bold=True))
         elif t == "day_total":
             requests.append(_fmt_row(sheet_id, i, bg=(0.76, 0.93, 0.78), bold=True))
         elif t == "day_total_delivery":
