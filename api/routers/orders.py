@@ -36,7 +36,7 @@ def _get_redis():
 async def create_order(user: CurrentUser, session: DbSession):
     from routers.cart import _get_order_date_and_lock, _load_settings
     cutoff_str, working_sats = await _load_settings(session)
-    order_date, is_locked = _get_order_date_and_lock(cutoff_str, working_sats)
+    order_date, is_locked, _ = _get_order_date_and_lock(cutoff_str, working_sats)
 
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Приём заказов завершён")
@@ -182,7 +182,7 @@ class OrderOut(BaseModel):
 async def get_current_orders(user: CurrentUser, session: DbSession):
     from routers.cart import _get_order_date_and_lock, _load_settings
     cutoff_str, working_sats = await _load_settings(session)
-    order_date, _ = _get_order_date_and_lock(cutoff_str, working_sats)
+    order_date, _, _opens = _get_order_date_and_lock(cutoff_str, working_sats)
 
     res = await session.execute(
         select(Order)
