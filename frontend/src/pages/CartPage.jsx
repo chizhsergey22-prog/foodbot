@@ -120,7 +120,7 @@ export default function CartPage() {
 
         {cart.is_locked && (
           <p className="text-center text-sm" style={{ color: 'var(--tg-theme-hint-color, #888)' }}>
-            Приём заказов на сегодня завершён
+            Приём заказов завершён. Форма откроется {cart.opens_at}
           </p>
         )}
       </div>
@@ -205,7 +205,7 @@ export default function CartPage() {
           <p className="text-4xl mb-3">🔒</p>
           <p className="font-semibold mb-2">Приём заказов закрыт</p>
           <p className="text-sm" style={{ color: 'var(--tg-theme-hint-color, #888)' }}>
-            Форма заказа откроется завтра утром
+            Форма заказа откроется {cart.opens_at}
           </p>
         </div>
       ) : (

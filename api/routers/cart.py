@@ -23,8 +23,8 @@ def _cart_key(user_id: int) -> str:
     return f"cart:{user_id}"
 
 
-def _get_order_date_and_lock(cutoff_str: str, working_sats: set[date] | None = None) -> tuple[date, bool]:
-    """Определяет дату заказа и заблокирована ли корзина."""
+def _get_order_date_and_lock(cutoff_str: str, working_sats: set[date] | None = None) -> tuple[date, bool, str]:
+    """Определяет дату заказа, заблокирована ли корзина, и когда откроется."""
     h, m = cutoff_str.split(":")
     cutoff_h, cutoff_m = int(h), int(m)
     OPEN_H = 12
@@ -39,6 +39,7 @@ def _get_order_date_and_lock(cutoff_str: str, working_sats: set[date] | None = N
     before_open  = (now.hour, now.minute) <  (OPEN_H, 0)
 
     wsat = working_sats or set()
+    opens_at = ""
 
     if weekday == 4:  # Пятница
         tomorrow = today + timedelta(days=1)
@@ -46,20 +47,28 @@ def _get_order_date_and_lock(cutoff_str: str, working_sats: set[date] | None = N
             # Рабочая суббота: окно 12–17
             order_date = tomorrow
             is_locked = before_open or after_cutoff
+            if is_locked:
+                opens_at = f"сегодня в {OPEN_H:02d}:00" if before_open else f"завтра в {OPEN_H:02d}:00"
         else:
             order_date = today + timedelta(days=3)  # Пн
             is_locked = not after_cutoff  # открывается в 17:00 пятницы
+            if is_locked:
+                opens_at = f"сегодня в {cutoff_h:02d}:{cutoff_m:02d}"
     elif weekday == 5:  # Сб → Пн, без ограничений
         order_date = today + timedelta(days=2)
         is_locked = False
     elif weekday == 6:  # Вс → Пн, до 17:00
         order_date = today + timedelta(days=1)
         is_locked = after_cutoff
+        if is_locked:
+            opens_at = f"завтра в {OPEN_H:02d}:00"
     else:  # Пн–Чт: окно 12–17
         order_date = today + timedelta(days=1)
         is_locked = before_open or after_cutoff
+        if is_locked:
+            opens_at = f"сегодня в {OPEN_H:02d}:00" if before_open else f"завтра в {OPEN_H:02d}:00"
 
-    return order_date, is_locked
+    return order_date, is_locked, opens_at
 
 
 class CartItem(BaseModel):
@@ -72,6 +81,7 @@ class CartItem(BaseModel):
 class CartResponse(BaseModel):
     order_date: date
     is_locked: bool
+    opens_at: str
     items: list[CartItem]
     total: float
 
@@ -102,7 +112,7 @@ async def _load_settings(session) -> tuple[str, set[date]]:
 @router.get("/", response_model=CartResponse)
 async def get_cart(user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
-    order_date, is_locked = _get_order_date_and_lock(cutoff_str, working_sats)
+    order_date, is_locked, opens_at = _get_order_date_and_lock(cutoff_str, working_sats)
 
     redis = _get_redis()
     try:
@@ -115,7 +125,7 @@ async def get_cart(user: CurrentUser, session: DbSession):
         items = [CartItem(**i) for i in json.loads(raw)]
 
     total = sum(i.price * i.quantity for i in items)
-    return CartResponse(order_date=order_date, is_locked=is_locked, items=items, total=total)
+    return CartResponse(order_date=order_date, is_locked=is_locked, opens_at=opens_at, items=items, total=total)
 
 
 class UpdateCartBody(BaseModel):
@@ -125,7 +135,7 @@ class UpdateCartBody(BaseModel):
 @router.put("/", response_model=CartResponse)
 async def update_cart(body: UpdateCartBody, user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
-    order_date, is_locked = _get_order_date_and_lock(cutoff_str, working_sats)
+    order_date, is_locked, opens_at = _get_order_date_and_lock(cutoff_str, working_sats)
 
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Cart is locked after cutoff time")
@@ -158,13 +168,13 @@ async def update_cart(body: UpdateCartBody, user: CurrentUser, session: DbSessio
         await redis.aclose()
 
     total = sum(i.price * i.quantity for i in valid_items)
-    return CartResponse(order_date=order_date, is_locked=is_locked, items=valid_items, total=total)
+    return CartResponse(order_date=order_date, is_locked=is_locked, opens_at=opens_at, items=valid_items, total=total)
 
 
 @router.delete("/")
 async def clear_cart(user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
-    _, is_locked = _get_order_date_and_lock(cutoff_str, working_sats)
+    _, is_locked, _opens = _get_order_date_and_lock(cutoff_str, working_sats)
 
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Cart is locked after cutoff time")
