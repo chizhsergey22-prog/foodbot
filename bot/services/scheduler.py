@@ -57,7 +57,7 @@ def _add_jobs(h: int, m: int) -> None:
     summary_h = h + 1 if m == 59 else h
     scheduler.add_job(
         _send_daily_summary,
-        CronTrigger(hour=summary_h, minute=summary_m, timezone=kyiv_tz),
+        CronTrigger(hour=summary_h, minute=summary_m, day_of_week="mon-fri,sun", timezone=kyiv_tz),
         id="send_summary",
         replace_existing=True,
     )
@@ -113,9 +113,10 @@ async def _send_open_notification() -> None:
         if tomorrow in working_sats:  # рабочая суббота — окно открывается сейчас
             order_date = tomorrow
             open_now = True
-        else:  # обычная суббота — окно откроется в {_cutoff_str} для понедельника
+        else:  # обычная пятница → Пн, корзина уже открыта с 12:00
             order_date = today_kyiv + timedelta(days=3)
-            open_now = False
+            open_now = True
+            cutoff_day_suffix = " воскресенья"  # дедлайн — вс 17:00
     elif weekday == 5:  # Суббота
         if today_kyiv in working_sats:  # рабочая суббота — окно на понедельник уже открыто
             order_date = today_kyiv + timedelta(days=2)

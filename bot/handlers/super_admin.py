@@ -664,10 +664,14 @@ async def on_cancel_approve(callback: CallbackQuery, db_user: User | None):
         await session.commit()
 
         # Уведомляем сотрудника
-        if order and user:
+        notify_user = None
+        if order:
+            _ur = await session.execute(select(User).where(User.id == order.user_id))
+            notify_user = _ur.scalar_one_or_none()
+        if order and notify_user:
             try:
                 await callback.bot.send_message(
-                    user.telegram_id,
+                    notify_user.telegram_id,
                     "✅ Ваш запрос на отмену заказа *одобрен*. Заказ отменён.",
                     parse_mode="Markdown",
                 )
