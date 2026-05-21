@@ -38,7 +38,7 @@ def setup_scheduler(bot: Bot, cutoff_h: int = 17, cutoff_m: int = 0) -> None:
 async def reschedule_jobs(bot: Bot, cutoff_h: int, cutoff_m: int) -> None:
     global _bot
     _bot = bot
-    for job_id in ("lock_orders", "send_summary", "send_reminder", "send_reminder_early", "open_notification"):
+    for job_id in ("send_summary", "send_reminder", "send_reminder_early", "open_notification"):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
     _add_jobs(cutoff_h, cutoff_m)
@@ -51,13 +51,6 @@ _cutoff_str: str = "17:00"
 def _add_jobs(h: int, m: int) -> None:
     global _cutoff_str
     _cutoff_str = f"{h:02d}:{m:02d}"
-
-    scheduler.add_job(
-        _lock_orders,
-        CronTrigger(hour=h, minute=m, timezone=kyiv_tz),
-        id="lock_orders",
-        replace_existing=True,
-    )
 
     # Отправка сводки через 1 минуту после дедлайна
     summary_m = (m + 1) % 60
@@ -202,40 +195,6 @@ async def _send_cutoff_reminder() -> None:
             log.error("Не удалось отправить напоминание %s: %s", user.telegram_id, e)
 
 
-async def _lock_orders() -> None:
-    """Блокирует все активные заказы на следующую дату доставки и добавляет долг."""
-    working_sats = await _get_working_sats()
-    today_kyiv = datetime.now(kyiv_tz).date()
-    tomorrow = today_kyiv + timedelta(days=1)
-    while tomorrow.weekday() == 6 or (tomorrow.weekday() == 5 and tomorrow not in working_sats):
-        tomorrow += timedelta(days=1)
-
-    async with async_session_maker() as session:
-        res = await session.execute(
-            select(Order)
-            .where(Order.order_date == tomorrow, Order.status == "active")
-            .options(selectinload(Order.user))
-        )
-        orders = res.scalars().all()
-
-        for order in orders:
-            order.status = "locked"
-            if order.user:
-                order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price
-
-        # Перенумеровываем все незакрытые заказы без пропусков
-        renumber_res = await session.execute(
-            select(Order)
-            .where(Order.order_date == tomorrow, Order.status != "cancelled")
-            .order_by(Order.created_at.asc())
-        )
-        for i, order in enumerate(renumber_res.scalars().all(), start=1):
-            order.daily_number = i
-
-        await session.commit()
-    log.info("Заблокировано заказов: %d", len(orders))
-
-
 async def _send_daily_summary() -> None:
     """Отправляет кухонную сводку и чеки администратору ресторана."""
     if _bot is None:
@@ -248,21 +207,37 @@ async def _send_daily_summary() -> None:
         tomorrow += timedelta(days=1)
 
     async with async_session_maker() as session:
-        # Включаем active, locked и cancel_requested — на случай если _lock_orders не сработал
         res = await session.execute(
             select(Order)
             .where(
                 Order.order_date == tomorrow,
-                Order.status.in_(["active", "locked", "cancel_requested"]),
+                Order.status == "active",
             )
             .options(selectinload(Order.items), selectinload(Order.user))
-            .order_by(Order.daily_number.asc())
+            .order_by(Order.created_at.asc())
         )
         orders = res.scalars().all()
 
         if not orders:
             log.info("Нет заказов на %s, сводка не отправляется.", tomorrow)
             return
+
+        # Нумеруем заказы перед отправкой сводки
+        for i, order in enumerate(orders, start=1):
+            order.daily_number = i
+        await session.commit()
+
+        # Перечитываем с обновлёнными номерами
+        res = await session.execute(
+            select(Order)
+            .where(
+                Order.order_date == tomorrow,
+                Order.status == "active",
+            )
+            .options(selectinload(Order.items), selectinload(Order.user))
+            .order_by(Order.daily_number.asc())
+        )
+        orders = res.scalars().all()
 
         date_str = tomorrow.strftime("%d.%m.%Y")
 
@@ -282,8 +257,7 @@ async def _send_daily_summary() -> None:
         checks_lines = [f"📋 <b>Заказы на {date_str}</b>\n"]
         for order in orders:
             num = order.daily_number or order.id
-            flag = " ⚠️" if order.status == "cancel_requested" else ""
-            checks_lines.append(f"<b>Заказ №{num}</b>{flag}")
+            checks_lines.append(f"<b>Заказ №{num}</b>")
             for item in order.items:
                 qty_str = f" ×{item.quantity}" if item.quantity > 1 else ""
                 checks_lines.append(f"  • {_esc(item.item_name)}{qty_str}")

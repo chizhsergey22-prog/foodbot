@@ -597,7 +597,7 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
         order = Order(
             user_id=user_id,
             order_date=order_date,
-            status="locked",
+            status="active",
             total_price=total,
             daily_number=daily_number,
         )
@@ -615,11 +615,6 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
                 price=item.price,
                 quantity=qty,
             ))
-
-        user_res = await session.execute(select(User).where(User.id == user_id))
-        user = user_res.scalar_one_or_none()
-        if user:
-            user.balance_debt = (user.balance_debt or Decimal(0)) + total
 
         await session.commit()
 
@@ -665,10 +660,6 @@ async def on_cancel_approve(callback: CallbackQuery, db_user: User | None):
         order = order_res.scalar_one_or_none()
         if order:
             order.status = "cancelled"
-            user_res = await session.execute(select(User).where(User.id == order.user_id))
-            user = user_res.scalar_one_or_none()
-            if user:
-                user.balance_debt = max(Decimal(0), user.balance_debt - order.total_price)
 
         await session.commit()
 
@@ -712,8 +703,8 @@ async def on_cancel_reject(callback: CallbackQuery, db_user: User | None):
 
         order_res = await session.execute(select(Order).where(Order.id == req.order_id))
         order = order_res.scalar_one_or_none()
-        if order and order.status == "cancel_requested":
-            order.status = "locked"
+        if order and order.status == "active":
+            order.status = "active"  # уже active, явно оставляем
 
         await session.commit()
 
@@ -772,7 +763,7 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             select(Order)
             .where(
                 Order.order_date == target,
-                Order.status.in_(["active", "locked", "cancel_requested"]),
+                Order.status == "active",
             )
             .options(selectinload(Order.user), selectinload(Order.items))
         )
@@ -782,20 +773,13 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             await message.answer(f"Нет активных заказов на {target.strftime('%d.%m.%Y')}.")
             return
 
-        # Если есть незалоченные (active) заказы — значит планировщик не сработал.
-        # Сначала добавляем стоимость еды к balance_debt (как делает _lock_orders),
-        # затем помечаем все как delivered.
-        unlocked_count = 0
+        import math
         for order in orders:
-            if order.status == "active":
-                unlocked_count += 1
-                # Добавляем стоимость еды, как это делает _lock_orders
-                if order.user:
-                    order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price
             order.status = "delivered"
+            if order.user:
+                order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price
 
         if taxi is not None:
-            import math
             n = len(orders)
             exact = float(taxi) / n
             per_person = math.ceil(exact)
@@ -837,11 +821,8 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             pass
 
     taxi_text = f"\n🚕 Такси: <b>{taxi:.0f} ₴</b>" if taxi is not None else ""
-    warning = ""
-    if unlocked_count > 0:
-        warning = f"\n\n⚠️ <b>Внимание:</b> {unlocked_count} заказ(ов) не были заблокированы планировщиком (были в статусе active). Стоимость еды добавлена к долгу автоматически."
     await message.answer(
-        f"✅ {len(orders)} заказ(ов) на {date_str} отмечены как <b>доставлены</b>.{taxi_text}{warning}",
+        f"✅ {len(orders)} заказ(ов) на {date_str} отмечены как <b>доставлены</b>.{taxi_text}",
         parse_mode="HTML",
     )
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import math
 import pytz
@@ -304,7 +304,7 @@ async def get_monthly_stats(user: CurrentUser, session: DbSession):
     return MonthlyStats(month=month, year=year, total=total, orders_count=count, balance_debt=float(u.balance_debt))
 
 
-# ── Запрос на отмену (после дедлайна) ────────────────────────────────────────
+# ── Запрос на отмену ─────────────────────────────────────────────────────────
 
 @router.post("/{order_id}/cancel-request", status_code=status.HTTP_202_ACCEPTED)
 async def request_cancel(order_id: int, request: Request, user: CurrentUser, session: DbSession):
@@ -315,54 +315,64 @@ async def request_cancel(order_id: int, request: Request, user: CurrentUser, ses
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
 
-    if order.status == "active":
+    if order.status != "active":
+        raise HTTPException(status_code=400, detail=f"Нельзя отменить заказ со статусом '{order.status}'")
+
+    # Проверяем: прошёл ли дедлайн для даты этого заказа
+    from routers.cart import _get_order_date_and_lock, _load_settings
+    cutoff_str, working_sats = await _load_settings(session)
+    next_order_date, is_locked, _ = _get_order_date_and_lock(cutoff_str, working_sats)
+
+    past_deadline = (
+        order.order_date < next_order_date or
+        (order.order_date == next_order_date and is_locked)
+    )
+
+    if not past_deadline:
+        # До дедлайна — мгновенная отмена
         order.status = "cancelled"
         await session.commit()
         logger.info("Order cancelled order_id=%s user_id=%s", order_id, user.id)
         return {"status": "cancelled"}
 
-    if order.status == "locked":
-        existing = await session.execute(
-            select(CancelRequest).where(CancelRequest.order_id == order_id, CancelRequest.status == "pending")
-        )
-        if existing.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Запрос уже отправлен")
+    # После дедлайна — запрос на отмену администратору
+    existing = await session.execute(
+        select(CancelRequest).where(CancelRequest.order_id == order_id, CancelRequest.status == "pending")
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Запрос уже отправлен")
 
-        cr = CancelRequest(order_id=order_id, user_id=user.id)
-        session.add(cr)
-        order.status = "cancel_requested"
-        await session.commit()
-        await session.refresh(cr)
-        logger.info("Cancel requested order_id=%s user_id=%s request_id=%s", order_id, user.id, cr.id)
+    cr = CancelRequest(order_id=order_id, user_id=user.id)
+    session.add(cr)
+    await session.commit()
+    await session.refresh(cr)
+    logger.info("Cancel requested order_id=%s user_id=%s request_id=%s", order_id, user.id, cr.id)
 
-        admins = (await session.execute(
-            select(User).where(User.role == "super_admin", User.is_active == True)
-        )).scalars().all()
+    admins = (await session.execute(
+        select(User).where(User.role == "super_admin", User.is_active == True)
+    )).scalars().all()
 
-        text = (
-            f"!!️ <b>{user.full_name}</b> запрашивает отмену заказа №{order_id} "
-            f"на {order.order_date.strftime('%d.%m.%Y')} "
-            f"({float(order.total_price):.0f} ₴)\n"
-            f"Запрос #: {cr.id}"
-        )
-        kb = {"inline_keyboard": [[
-            {"text": "✅ Подтвердить", "callback_data": f"cancel_approve:{cr.id}"},
-            {"text": "❌ Отклонить",   "callback_data": f"cancel_reject:{cr.id}"},
-        ]]}
-        # FIX: Use singleton aiohttp session from app.state
-        http_session = request.app.state.http_session
-        url = f"https://api.telegram.org/bot{settings.BOT_TOKEN}/sendMessage"
-        for admin in admins:
-            try:
-                await http_session.post(url, json={
-                    "chat_id": admin.telegram_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "reply_markup": kb,
-                })
-            except Exception:
-                logger.exception("Failed to notify admin telegram_id=%s for cancel request=%s", admin.telegram_id, cr.id)
+    text = (
+        f"⚠️ <b>{user.full_name}</b> запрашивает отмену заказа №{order_id} "
+        f"на {order.order_date.strftime('%d.%m.%Y')} "
+        f"({float(order.total_price):.0f} ₴)\n"
+        f"Запрос #: {cr.id}"
+    )
+    kb = {"inline_keyboard": [[
+        {"text": "✅ Подтвердить", "callback_data": f"cancel_approve:{cr.id}"},
+        {"text": "❌ Отклонить",   "callback_data": f"cancel_reject:{cr.id}"},
+    ]]}
+    http_session = request.app.state.http_session
+    url = f"https://api.telegram.org/bot{settings.BOT_TOKEN}/sendMessage"
+    for admin in admins:
+        try:
+            await http_session.post(url, json={
+                "chat_id": admin.telegram_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": kb,
+            })
+        except Exception:
+            logger.exception("Failed to notify admin telegram_id=%s for cancel request=%s", admin.telegram_id, cr.id)
 
-        return {"status": "cancel_requested", "request_id": cr.id}
-
-    raise HTTPException(status_code=400, detail=f"Нельзя отменить заказ со статусом '{order.status}'")
+    return {"status": "cancel_requested", "request_id": cr.id}
