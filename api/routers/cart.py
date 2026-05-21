@@ -49,9 +49,9 @@ def _get_order_date_and_lock(cutoff_str: str, working_sats: set[date] | None = N
                 opens_at = f"сегодня в {OPEN_H:02d}:00" if before_open else f"завтра в {OPEN_H:02d}:00"
         else:
             order_date = today + timedelta(days=3)  # Пн
-            is_locked = not after_cutoff  # открывается в 17:00 пятницы
+            is_locked = before_open  # opens 12:00 Fri, closes Sun 17:00
             if is_locked:
-                opens_at = f"сегодня в {cutoff_h:02d}:{cutoff_m:02d}"
+                opens_at = f"сегодня в {OPEN_H:02d}:00"
     elif weekday == 5:  # Сб → Пн, без ограничений
         order_date = today + timedelta(days=2)
         is_locked = False
