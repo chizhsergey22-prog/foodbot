@@ -16,8 +16,26 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import redis.asyncio as aioredis
+    import aiohttp
+
     logger.info("API starting up")
+
+    # FIX: Create a single Redis connection pool for the entire app lifetime
+    app.state.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    logger.info("Redis connection pool created")
+
+    # FIX: Create a single aiohttp session for outgoing HTTP requests (Telegram API)
+    app.state.http_session = aiohttp.ClientSession()
+    logger.info("HTTP session created")
+
     yield
+
+    # Cleanup on shutdown
+    await app.state.http_session.close()
+    logger.info("HTTP session closed")
+    await app.state.redis.aclose()
+    logger.info("Redis connection pool closed")
     logger.info("API shutting down")
 
 

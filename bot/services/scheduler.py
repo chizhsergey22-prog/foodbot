@@ -218,19 +218,10 @@ async def _lock_orders() -> None:
         )
         orders = res.scalars().all()
 
-        # Pre-fill users that already have locked orders (created via /addorder)
-        # to avoid charging delivery twice
-        already_res = await session.execute(
-            select(Order.user_id).where(Order.order_date == tomorrow, Order.status == "locked")
-        )
-        users_charged: set[int] = {row[0] for row in already_res.all()}
-
         for order in orders:
             order.status = "locked"
             if order.user:
-                delivery = Decimal("10") if order.user_id not in users_charged else Decimal("0")
-                users_charged.add(order.user_id)
-                order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price + delivery
+                order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price
 
         # Перенумеровываем все незакрытые заказы без пропусков
         renumber_res = await session.execute(
@@ -257,12 +248,12 @@ async def _send_daily_summary() -> None:
         tomorrow += timedelta(days=1)
 
     async with async_session_maker() as session:
-        # Включаем locked и cancel_requested — заказы ещё готовятся, отмена не одобрена
+        # Включаем active, locked и cancel_requested — на случай если _lock_orders не сработал
         res = await session.execute(
             select(Order)
             .where(
                 Order.order_date == tomorrow,
-                Order.status.in_(["locked", "cancel_requested"]),
+                Order.status.in_(["active", "locked", "cancel_requested"]),
             )
             .options(selectinload(Order.items), selectinload(Order.user))
             .order_by(Order.daily_number.asc())

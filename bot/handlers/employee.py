@@ -6,11 +6,12 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
-from sqlalchemy import select
-from db.models import User, InviteCode, Order, CancelRequest
+from sqlalchemy import select, func, extract
+from db.models import User, InviteCode, Order, CancelRequest, DailyStat
 from db.connection import async_session_maker
 from keyboards.inline import miniapp_keyboard, restaurant_admin_keyboard
 from config import settings
+import pytz
 
 router = Router(name="employee")
 
@@ -111,7 +112,62 @@ async def cmd_mydebt(message: Message, db_user: User | None):
     if not db_user:
         await message.answer("Сначала пройдите регистрацию: /start")
         return
+
+    import math
+    from datetime import datetime
+
+    settings_tz = pytz.timezone("Europe/Kyiv")
+    now = datetime.now(settings_tz)
+    month, year = now.month, now.year
+
+    async with async_session_maker() as session:
+        # Food: non-cancelled (includes locked future orders)
+        res = await session.execute(
+            select(func.sum(Order.total_price))
+            .where(
+                Order.user_id == db_user.id,
+                extract("month", Order.order_date) == month,
+                extract("year", Order.order_date) == year,
+                Order.status != "cancelled",
+            )
+        )
+        food_total = float(res.scalar() or 0)
+
+        # Delivery: taxi-split for delivered days only
+        dates_res = await session.execute(
+            select(Order.order_date.distinct())
+            .where(
+                Order.user_id == db_user.id,
+                extract("month", Order.order_date) == month,
+                extract("year", Order.order_date) == year,
+                Order.status == "delivered",
+            )
+        )
+        delivered_dates = [r[0] for r in dates_res.all()]
+
+        delivery_total = 0.0
+        for od in delivered_dates:
+            taxi_res = await session.execute(
+                select(DailyStat.taxi_cost).where(DailyStat.order_date == od)
+            )
+            taxi = float(taxi_res.scalar_one_or_none() or 0)
+            if taxi > 0:
+                n_res = await session.execute(
+                    select(func.count(Order.id))
+                    .where(Order.order_date == od, Order.status == "delivered")
+                )
+                n = n_res.scalar() or 0
+                if n > 0:
+                    exact = taxi / n
+                    per_person = math.ceil(exact)
+                    if per_person - exact < 0.50:
+                        per_person += 1
+                    delivery_total += per_person
+
+    total = food_total + delivery_total
+    MONTHS_RU = ["январь","февраль","март","апрель","май","июнь",
+                 "июль","август","сентябрь","октябрь","ноябрь","декабрь"]
     await message.answer(
-        f"💰 Ваш текущий накопленный долг: *{db_user.balance_debt} ₴*",
+        f"💰 Ваш долг за {MONTHS_RU[month-1]}: *{total:.0f} ₴*",
         parse_mode="Markdown",
     )

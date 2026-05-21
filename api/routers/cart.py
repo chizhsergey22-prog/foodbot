@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from datetime import date, timedelta
 import pytz
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from db.models import MenuItem, Setting, Order
@@ -14,9 +14,7 @@ router = APIRouter(prefix="/cart", tags=["cart"])
 CART_TTL = 60 * 60 * 24 * 3  # 3 дня
 
 
-def _get_redis():
-    import redis.asyncio as aioredis
-    return aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+# Redis is now managed via request.app.state.redis
 
 
 def _cart_key(user_id: int) -> str:
@@ -110,15 +108,12 @@ async def _load_settings(session) -> tuple[str, set[date]]:
 
 
 @router.get("/", response_model=CartResponse)
-async def get_cart(user: CurrentUser, session: DbSession):
+async def get_cart(request: Request, user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
     order_date, is_locked, opens_at = _get_order_date_and_lock(cutoff_str, working_sats)
 
-    redis = _get_redis()
-    try:
-        raw = await redis.get(_cart_key(user.id))
-    finally:
-        await redis.aclose()
+    redis = request.app.state.redis
+    raw = await redis.get(_cart_key(user.id))
 
     items: list[CartItem] = []
     if raw:
@@ -133,7 +128,7 @@ class UpdateCartBody(BaseModel):
 
 
 @router.put("/", response_model=CartResponse)
-async def update_cart(body: UpdateCartBody, user: CurrentUser, session: DbSession):
+async def update_cart(body: UpdateCartBody, request: Request, user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
     order_date, is_locked, opens_at = _get_order_date_and_lock(cutoff_str, working_sats)
 
@@ -158,31 +153,25 @@ async def update_cart(body: UpdateCartBody, user: CurrentUser, session: DbSessio
                 quantity=item.quantity,
             ))
 
-    redis = _get_redis()
-    try:
-        if valid_items:
-            await redis.set(_cart_key(user.id), json.dumps([i.model_dump() for i in valid_items]), ex=CART_TTL)
-        else:
-            await redis.delete(_cart_key(user.id))
-    finally:
-        await redis.aclose()
+    redis = request.app.state.redis
+    if valid_items:
+        await redis.set(_cart_key(user.id), json.dumps([i.model_dump() for i in valid_items]), ex=CART_TTL)
+    else:
+        await redis.delete(_cart_key(user.id))
 
     total = sum(i.price * i.quantity for i in valid_items)
     return CartResponse(order_date=order_date, is_locked=is_locked, opens_at=opens_at, items=valid_items, total=total)
 
 
 @router.delete("/")
-async def clear_cart(user: CurrentUser, session: DbSession):
+async def clear_cart(request: Request, user: CurrentUser, session: DbSession):
     cutoff_str, working_sats = await _load_settings(session)
     _, is_locked, _opens = _get_order_date_and_lock(cutoff_str, working_sats)
 
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Cart is locked after cutoff time")
 
-    redis = _get_redis()
-    try:
-        await redis.delete(_cart_key(user.id))
-    finally:
-        await redis.aclose()
+    redis = request.app.state.redis
+    await redis.delete(_cart_key(user.id))
 
     return {"status": "cleared"}

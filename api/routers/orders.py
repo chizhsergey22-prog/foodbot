@@ -3,13 +3,14 @@ import json
 import logging
 from datetime import date, timedelta
 from decimal import Decimal
+import math
 import pytz
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy import select, extract, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
-from db.models import Order, OrderItem, MenuItem, User, Setting, CancelRequest
+from db.models import Order, OrderItem, MenuItem, User, Setting, CancelRequest, DailyStat
 from dependencies import CurrentUser, DbSession
 from config import settings
 
@@ -25,15 +26,10 @@ def _lock_key(user_id: int, order_date: date) -> str:
     return f"order_lock:{user_id}:{order_date}"
 
 
-def _get_redis():
-    import redis.asyncio as aioredis
-    return aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-
-
 # ── Оформление заказа ────────────────────────────────────────────────────────
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_order(user: CurrentUser, session: DbSession):
+async def create_order(request: Request, user: CurrentUser, session: DbSession):
     from routers.cart import _get_order_date_and_lock, _load_settings
     cutoff_str, working_sats = await _load_settings(session)
     order_date, is_locked, _ = _get_order_date_and_lock(cutoff_str, working_sats)
@@ -41,24 +37,19 @@ async def create_order(user: CurrentUser, session: DbSession):
     if is_locked:
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Приём заказов завершён")
 
+    # FIX: Use singleton Redis from app.state instead of creating new connection each time
+    redis = request.app.state.redis
+
     # п.15: Redis lock — защита от двойного оформления
     lock_key = _lock_key(user.id, order_date)
-    redis = _get_redis()
-    try:
-        acquired = await redis.set(lock_key, "1", nx=True, ex=10)
-    finally:
-        await redis.aclose()
+    acquired = await redis.set(lock_key, "1", nx=True, ex=10)
 
     if not acquired:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Заказ уже оформляется")
 
     try:
         # Читаем корзину из Redis
-        redis = _get_redis()
-        try:
-            raw = await redis.get(_cart_key(user.id))
-        finally:
-            await redis.aclose()
+        raw = await redis.get(_cart_key(user.id))
 
         if not raw:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Корзина пуста")
@@ -116,22 +107,16 @@ async def create_order(user: CurrentUser, session: DbSession):
 
     finally:
         # Снимаем lock в любом случае — заказ создан или упал
-        redis = _get_redis()
         try:
             await redis.delete(lock_key)
         except Exception:
             logger.warning("Failed to release order lock user=%s", user.id)
-        finally:
-            await redis.aclose()
 
     # п.6: После успешного commit — чистим корзину
-    redis = _get_redis()
     try:
         await redis.delete(_cart_key(user.id))
     except Exception:
         logger.warning("Failed to clear cart after order creation user=%s", user.id)
-    finally:
-        await redis.aclose()
 
     # п.6: После commit — Telegram уведомление (сбой не ломает заказ)
     items_text = "\n".join(
@@ -144,17 +129,17 @@ async def create_order(user: CurrentUser, session: DbSession):
         f"{items_text}\n\n"
         f"💰 Итого: {float(total):.0f} ₴"
     )
-    import aiohttp
+    # FIX: Use singleton aiohttp session from app.state instead of creating new one
+    http_session = request.app.state.http_session
     tg_url = f"https://api.telegram.org/bot{settings.BOT_TOKEN}/sendMessage"
-    async with aiohttp.ClientSession() as http:
-        try:
-            await http.post(tg_url, json={
-                "chat_id": user.telegram_id,
-                "text": tg_text,
-                "parse_mode": "HTML",
-            })
-        except Exception:
-            logger.exception("Telegram notification failed order_id=%s user_id=%s", order.id, user.id)
+    try:
+        await http_session.post(tg_url, json={
+            "chat_id": user.telegram_id,
+            "text": tg_text,
+            "parse_mode": "HTML",
+        })
+    except Exception:
+        logger.exception("Telegram notification failed order_id=%s user_id=%s", order.id, user.id)
 
     return {"order_id": order.id, "order_date": str(order_date), "total": float(total)}
 
@@ -245,11 +230,11 @@ async def get_monthly_stats(user: CurrentUser, session: DbSession):
     now = datetime.datetime.now(pytz.timezone(settings.TIMEZONE))
     month, year = now.month, now.year
 
+    # Food: all non-cancelled (includes locked future orders)
     res = await session.execute(
         select(
             func.sum(Order.total_price),
             func.count(Order.id),
-            func.count(Order.order_date.distinct()),
         )
         .where(
             Order.user_id == user.id,
@@ -261,8 +246,57 @@ async def get_monthly_stats(user: CurrentUser, session: DbSession):
     row = res.one()
     food_total = float(row[0] or 0)
     count = row[1] or 0
-    days = row[2] or 0
-    total = food_total + days * 10
+
+    # FIX: Delivery calculation - single query with JOIN + GROUP BY instead of N+1
+    delivery_res = await session.execute(
+        select(
+            DailyStat.order_date,
+            DailyStat.taxi_cost,
+            func.count(Order.id),
+        )
+        .join(Order, Order.order_date == DailyStat.order_date)
+        .where(
+            Order.user_id == user.id,
+            extract("month", Order.order_date) == month,
+            extract("year", Order.order_date) == year,
+            Order.status == "delivered",
+            DailyStat.taxi_cost > 0,
+        )
+        .group_by(DailyStat.order_date, DailyStat.taxi_cost)
+    )
+
+    # We need total delivered orders per day (not just this user's),
+    # so we need a second query for the total count per day
+    user_delivered_dates = []
+    taxi_by_date = {}
+    for od, taxi, user_count in delivery_res.all():
+        user_delivered_dates.append(od)
+        taxi_by_date[od] = float(taxi)
+
+    delivery_total = 0.0
+    if user_delivered_dates:
+        # Get total delivered orders per day for all users (for splitting taxi cost)
+        total_counts_res = await session.execute(
+            select(Order.order_date, func.count(Order.id))
+            .where(
+                Order.order_date.in_(user_delivered_dates),
+                Order.status == "delivered",
+            )
+            .group_by(Order.order_date)
+        )
+        day_counts = {od: cnt for od, cnt in total_counts_res.all()}
+
+        for od in user_delivered_dates:
+            taxi = taxi_by_date[od]
+            n = day_counts.get(od, 0)
+            if n > 0:
+                exact = taxi / n
+                per_person = math.ceil(exact)
+                if per_person - exact < 0.50:
+                    per_person += 1
+                delivery_total += per_person
+
+    total = food_total + delivery_total
 
     user_res = await session.execute(select(User).where(User.id == user.id))
     u = user_res.scalar_one()
@@ -273,7 +307,7 @@ async def get_monthly_stats(user: CurrentUser, session: DbSession):
 # ── Запрос на отмену (после дедлайна) ────────────────────────────────────────
 
 @router.post("/{order_id}/cancel-request", status_code=status.HTTP_202_ACCEPTED)
-async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
+async def request_cancel(order_id: int, request: Request, user: CurrentUser, session: DbSession):
     res = await session.execute(
         select(Order).where(Order.id == order_id, Order.user_id == user.id)
     )
@@ -306,7 +340,7 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
         )).scalars().all()
 
         text = (
-            f"⚠️ <b>{user.full_name}</b> запрашивает отмену заказа №{order_id} "
+            f"!!️ <b>{user.full_name}</b> запрашивает отмену заказа №{order_id} "
             f"на {order.order_date.strftime('%d.%m.%Y')} "
             f"({float(order.total_price):.0f} ₴)\n"
             f"Запрос #: {cr.id}"
@@ -315,19 +349,19 @@ async def request_cancel(order_id: int, user: CurrentUser, session: DbSession):
             {"text": "✅ Подтвердить", "callback_data": f"cancel_approve:{cr.id}"},
             {"text": "❌ Отклонить",   "callback_data": f"cancel_reject:{cr.id}"},
         ]]}
-        import aiohttp
+        # FIX: Use singleton aiohttp session from app.state
+        http_session = request.app.state.http_session
         url = f"https://api.telegram.org/bot{settings.BOT_TOKEN}/sendMessage"
-        async with aiohttp.ClientSession() as http:
-            for admin in admins:
-                try:
-                    await http.post(url, json={
-                        "chat_id": admin.telegram_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        "reply_markup": kb,
-                    })
-                except Exception:
-                    logger.exception("Failed to notify admin telegram_id=%s for cancel request=%s", admin.telegram_id, cr.id)
+        for admin in admins:
+            try:
+                await http_session.post(url, json={
+                    "chat_id": admin.telegram_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": kb,
+                })
+            except Exception:
+                logger.exception("Failed to notify admin telegram_id=%s for cancel request=%s", admin.telegram_id, cr.id)
 
         return {"status": "cancel_requested", "request_id": cr.id}
 

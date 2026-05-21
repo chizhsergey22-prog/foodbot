@@ -338,13 +338,16 @@ async def cmd_balances(message: Message, command: CommandObject, db_user: User |
         today = _date.today()
         month, year = today.month, today.year
 
+    import math
+
     async with async_session_maker() as session:
+        # Food: non-cancelled (includes locked future)
         res = await session.execute(
             select(
+                User.id,
                 User.full_name,
                 User.team,
                 func.sum(Order.total_price),
-                func.count(Order.order_date.distinct()),
             )
             .join(Order, Order.user_id == User.id)
             .where(
@@ -357,6 +360,53 @@ async def cmd_balances(message: Message, command: CommandObject, db_user: User |
         )
         rows = res.all()
 
+        # Taxi-split delivery: per-day from DailyStat for delivered orders
+        taxi_res = await session.execute(
+            select(DailyStat.order_date, DailyStat.taxi_cost)
+            .where(
+                extract("month", DailyStat.order_date) == month,
+                extract("year", DailyStat.order_date) == year,
+                DailyStat.taxi_cost > 0,
+            )
+        )
+        taxi_data = {row[0]: float(row[1]) for row in taxi_res.all()}
+
+        count_res = await session.execute(
+            select(Order.order_date, func.count(Order.id))
+            .where(
+                extract("month", Order.order_date) == month,
+                extract("year", Order.order_date) == year,
+                Order.status == "delivered",
+            )
+            .group_by(Order.order_date)
+        )
+        day_count = {row[0]: row[1] for row in count_res.all()}
+
+        def calc_delivery(taxi, n):
+            if n == 0 or taxi == 0:
+                return 0
+            exact = taxi / n
+            per_person = math.ceil(exact)
+            if per_person - exact < 0.50:
+                per_person += 1
+            return per_person
+
+        day_delivery = {d: calc_delivery(taxi, day_count.get(d, 0)) for d, taxi in taxi_data.items()}
+
+        # Per-user delivery: sum over their delivered days
+        user_dates_res = await session.execute(
+            select(Order.user_id, Order.order_date)
+            .where(
+                extract("month", Order.order_date) == month,
+                extract("year", Order.order_date) == year,
+                Order.status == "delivered",
+            )
+            .distinct()
+        )
+        user_delivery: dict[int, float] = {}
+        for uid, d in user_dates_res.all():
+            user_delivery[uid] = user_delivery.get(uid, 0) + day_delivery.get(d, 0)
+
     MONTHS_RU = ["Январь","Февраль","Март","Апрель","Май","Июнь",
                  "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
 
@@ -364,12 +414,11 @@ async def cmd_balances(message: Message, command: CommandObject, db_user: User |
         await message.answer(f"📊 Заказов за {MONTHS_RU[month-1]} {year} нет.")
         return
 
-    # Группируем по командам
     from itertools import groupby
     teams: dict[str, list] = {}
-    for name, team, food_sum, days in rows:
+    for uid, name, team, food_sum in rows:
         key = team or "Без команды"
-        display_total = float(food_sum) + int(days) * 10
+        display_total = float(food_sum) + user_delivery.get(uid, 0)
         teams.setdefault(key, []).append((name, display_total))
 
     TEAM_ORDER = ["Тапок", "СС", "Танк", "Без команды"]
@@ -521,6 +570,7 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Не выбрано ни одного блюда!", show_alert=True)
         return
 
+    # FIX: Merged two separate sessions into one to reduce DB connection overhead
     async with async_session_maker() as session:
         wsat_res = await session.execute(select(Setting).where(Setting.key == "working_saturdays"))
         wsat_row = wsat_res.scalar_one_or_none()
@@ -528,9 +578,8 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
         cutoff_row = cutoff_res.scalar_one_or_none()
         working_sats = parse_working_sats(wsat_row.value if wsat_row else "")
         h, m = parse_cutoff(cutoff_row.value if cutoff_row else "17:00")
-    order_date = get_next_order_date(cutoff_hour=h, cutoff_minute=m, working_sats=working_sats)
+        order_date = get_next_order_date(cutoff_hour=h, cutoff_minute=m, working_sats=working_sats)
 
-    async with async_session_maker() as session:
         item_ids = [int(k) for k in selected]
         items_res = await session.execute(select(MenuItem).where(MenuItem.id.in_(item_ids)))
         items_map = {str(item.id): item for item in items_res.scalars().all()}
@@ -570,16 +619,7 @@ async def ao_confirm(callback: CallbackQuery, state: FSMContext):
         user_res = await session.execute(select(User).where(User.id == user_id))
         user = user_res.scalar_one_or_none()
         if user:
-            other_orders = await session.execute(
-                select(func.count(Order.id)).where(
-                    Order.user_id == user_id,
-                    Order.order_date == order_date,
-                    Order.status != "cancelled",
-                    Order.id != order.id,
-                )
-            )
-            delivery = Decimal("10") if (other_orders.scalar() or 0) == 0 else Decimal("0")
-            user.balance_debt = (user.balance_debt or Decimal(0)) + total + delivery
+            user.balance_debt = (user.balance_debt or Decimal(0)) + total
 
         await session.commit()
 
@@ -628,16 +668,7 @@ async def on_cancel_approve(callback: CallbackQuery, db_user: User | None):
             user_res = await session.execute(select(User).where(User.id == order.user_id))
             user = user_res.scalar_one_or_none()
             if user:
-                remaining = await session.execute(
-                    select(func.count(Order.id)).where(
-                        Order.user_id == order.user_id,
-                        Order.order_date == order.order_date,
-                        Order.status != "cancelled",
-                        Order.id != order.id,
-                    )
-                )
-                refund = order.total_price + (Decimal("10") if (remaining.scalar() or 0) == 0 else Decimal("0"))
-                user.balance_debt = max(Decimal(0), user.balance_debt - refund)
+                user.balance_debt = max(Decimal(0), user.balance_debt - order.total_price)
 
         await session.commit()
 
@@ -741,7 +772,7 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             select(Order)
             .where(
                 Order.order_date == target,
-                Order.status.in_(["locked", "cancel_requested"]),
+                Order.status.in_(["active", "locked", "cancel_requested"]),
             )
             .options(selectinload(Order.user), selectinload(Order.items))
         )
@@ -751,10 +782,30 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             await message.answer(f"Нет активных заказов на {target.strftime('%d.%m.%Y')}.")
             return
 
+        # Если есть незалоченные (active) заказы — значит планировщик не сработал.
+        # Сначала добавляем стоимость еды к balance_debt (как делает _lock_orders),
+        # затем помечаем все как delivered.
+        unlocked_count = 0
         for order in orders:
+            if order.status == "active":
+                unlocked_count += 1
+                # Добавляем стоимость еды, как это делает _lock_orders
+                if order.user:
+                    order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + order.total_price
             order.status = "delivered"
 
         if taxi is not None:
+            import math
+            n = len(orders)
+            exact = float(taxi) / n
+            per_person = math.ceil(exact)
+            if per_person - exact < 0.50:
+                per_person += 1
+            per_person_dec = Decimal(str(per_person))
+            for order in orders:
+                if order.user:
+                    order.user.balance_debt = (order.user.balance_debt or Decimal(0)) + per_person_dec
+
             stat_res = await session.execute(select(DailyStat).where(DailyStat.order_date == target))
             stat = stat_res.scalar_one_or_none()
             if stat:
@@ -786,8 +837,11 @@ async def cmd_deliver(message: Message, command: CommandObject, db_user: User | 
             pass
 
     taxi_text = f"\n🚕 Такси: <b>{taxi:.0f} ₴</b>" if taxi is not None else ""
+    warning = ""
+    if unlocked_count > 0:
+        warning = f"\n\n⚠️ <b>Внимание:</b> {unlocked_count} заказ(ов) не были заблокированы планировщиком (были в статусе active). Стоимость еды добавлена к долгу автоматически."
     await message.answer(
-        f"✅ {len(orders)} заказ(ов) на {date_str} отмечены как <b>доставлены</b>.{taxi_text}",
+        f"✅ {len(orders)} заказ(ов) на {date_str} отмечены как <b>доставлены</b>.{taxi_text}{warning}",
         parse_mode="HTML",
     )
 

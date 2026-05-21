@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import calendar
 from datetime import date
 from sqlalchemy import select, extract
@@ -13,7 +14,6 @@ log = logging.getLogger(__name__)
 MONTHS_RU = ["Январь","Февраль","Март","Апрель","Май","Июнь",
              "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
 TEAM_ORDER = ["Тапок", "СС", "Танк", "Без команды"]
-DELIVERY_FEE = 10.0
 DAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт"]
 
 
@@ -97,16 +97,43 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
     n_days = len(workdays)
     n_cols = n_days + 2  # имя + дни + тотал
 
+    # Pre-compute per-day order counts and dynamic delivery fee
+    workdays_idx = {d: i for i, d in enumerate(workdays)}
+    global_day_food = [0.0] * n_days
+    global_day_orders = [0] * n_days
+    for (uid, d), food in order_lookup.items():
+        if d in workdays_idx:
+            idx = workdays_idx[d]
+            global_day_food[idx] += food
+            global_day_orders[idx] += 1
+
+    def _calc_delivery(taxi: float, n: int) -> int:
+        if n == 0 or taxi == 0:
+            return 0
+        exact = taxi / n
+        per_person = math.ceil(exact)
+        if per_person - exact < 0.50:
+            per_person += 1
+        return per_person
+
+    day_delivery = {
+        d: _calc_delivery(taxi_lookup.get(d, 0.0), global_day_orders[workdays_idx[d]])
+        for d in workdays
+    }
+
     sheet_title = f"{MONTHS_RU[month-1]} {year}"
     try:
         sh = gc.open_by_key(settings.GOOGLE_REPORT_SHEET_ID)
+        n_rows = len(employees) + len(TEAM_ORDER) * 4 + 20
         try:
             ws = sh.worksheet(sheet_title)
-            sh.del_worksheet(ws)
+            # FIX: Clear and resize instead of delete + recreate
+            # This preserves the sheet's gid, preventing #REF! errors
+            # in external formulas that reference this sheet
+            ws.clear()
+            ws.resize(rows=max(n_rows, 100), cols=n_cols)
         except gspread.WorksheetNotFound:
-            pass
-        n_rows = len(employees) + len(TEAM_ORDER) * 4 + 20
-        ws = sh.add_worksheet(title=sheet_title, rows=max(n_rows, 100), cols=n_cols)
+            ws = sh.add_worksheet(title=sheet_title, rows=max(n_rows, 100), cols=n_cols)
     except RuntimeError:
         raise
     except Exception as e:
@@ -156,7 +183,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
             for i, d in enumerate(workdays):
                 key = (emp["id"], d)
                 if key in order_lookup:
-                    val = order_lookup[key] + DELIVERY_FEE
+                    val = order_lookup[key] + day_delivery[d]
                     row.append(int(round(val)))
                     emp_sum += val
                     day_sums[i] += val
@@ -175,15 +202,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
 
         grand_total += team_sum
 
-    # Per-day totals from order_lookup
-    workdays_idx = {d: i for i, d in enumerate(workdays)}
-    global_day_food = [0.0] * n_days
-    global_day_orders = [0] * n_days
-    for (uid, d), food in order_lookup.items():
-        if d in workdays_idx:
-            idx = workdays_idx[d]
-            global_day_food[idx] += food
-            global_day_orders[idx] += 1
+    # Per-day totals (pre-computed above)
 
     day_food_row = ["Итого за день (еда)"]
     day_del_row = ["Итого за день (с доставкой)"]
@@ -192,7 +211,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
     for i in range(n_days):
         if global_day_orders[i] > 0:
             f = global_day_food[i]
-            t = f + global_day_orders[i] * DELIVERY_FEE
+            t = f + global_day_orders[i] * day_delivery[workdays[i]]
             day_food_row.append(int(round(f)))
             day_del_row.append(int(round(t)))
             day_food_sum += f
@@ -216,7 +235,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
         taxi_month_total += t
     taxi_row.append(int(round(taxi_month_total)) if taxi_month_total > 0 else "")
 
-    grand_food = grand_total - n_delivery_days * DELIVERY_FEE
+    grand_food = grand_total - sum(global_day_orders[i] * day_delivery[workdays[i]] for i in range(n_days))
 
     add([""] * n_cols, "blank")
     add(day_count_row, "day_count")
@@ -228,7 +247,7 @@ def _create_spreadsheet(data: dict, month: int, year: int) -> str:
     delivery_month_total = 0.0
     for i in range(n_days):
         if global_day_orders[i] > 0:
-            d_fee = int(round(global_day_orders[i] * DELIVERY_FEE))
+            d_fee = int(round(global_day_orders[i] * day_delivery[workdays[i]]))
             delivery_row.append(d_fee)
             delivery_month_total += d_fee
         else:
